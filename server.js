@@ -1,9 +1,17 @@
-// Cammy Unified Memory API v1.0
+// Cammy Unified Memory API v1.1
 // Endpoints:
 //   POST /facts/extract   - extract + embed facts from session transcript
 //   POST /facts/search    - semantic search over vector store
+//   POST /facts/sync      - pull facts learned in OTHER sessions into this one
 //   POST /facts/upsert    - directly upsert a single fact
+//   GET  /sessions        - list known sessions with fact counts
 //   GET  /health          - health check
+//
+// NEW in v1.1: session scoping. Facts were always stamped with session_id /
+// session_type but nothing read them back, so every session searched one flat
+// pool. /facts/search now takes session filters, and /facts/sync uses them to
+// answer the question a fresh session actually has: "what did the other
+// sessions learn that I don't know yet?"
 
 import express from "express";
 import https from "https";
@@ -35,6 +43,7 @@ function postJSON(url, body, headers = {}) {
     const mod = url.startsWith("https") ? https : http;
     const req = mod.request({
       hostname: urlObj.hostname,
+      port: urlObj.port || undefined, // else an explicit port (e.g. Qdrant :6333) is dropped
       path: urlObj.pathname + urlObj.search,
       method: "POST",
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), ...headers },
@@ -58,6 +67,7 @@ function putJSON(url, body, headers = {}) {
     const mod = url.startsWith("https") ? https : http;
     const req = mod.request({
       hostname: urlObj.hostname,
+      port: urlObj.port || undefined, // else an explicit port (e.g. Qdrant :6333) is dropped
       path: urlObj.pathname + urlObj.search,
       method: "PUT",
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), ...headers },
@@ -82,6 +92,87 @@ async function ensureCollection() {
       { "api-key": QDRANT_KEY }
     );
   } catch(e) { /* already exists */ }
+  // Payload indexes for the session filters — best effort, no-op once created.
+  for (const field of ["session_id", "session_type", "category"]) {
+    try {
+      await putJSON(`${QDRANT_URL}/collections/${COLLECTION}/index`,
+        { field_name: field, field_schema: "keyword" },
+        { "api-key": QDRANT_KEY }
+      );
+    } catch(e) { /* already indexed */ }
+  }
+}
+
+// ── Shared: is this fact still valid right now? ─────────────
+function isLive(payload, now) {
+  if (payload.expiry_type === "DATE" && payload.valid_until) return new Date(payload.valid_until) > now;
+  return true;
+}
+
+// ── Shared: build a Qdrant filter for session/category scoping ──
+// `since` is deliberately NOT pushed down here: created_at is an ISO string,
+// and range-filtering it in Qdrant would need a datetime index. ISO-8601 sorts
+// lexicographically, so callers filter it in-app instead.
+function buildFilter({ categories = [], session_id, exclude_session_id, session_types = [] }) {
+  const must = [], must_not = [];
+  if (categories.length) must.push({ key: "category", match: { any: categories.map(t => String(t).toUpperCase()) } });
+  if (session_types.length) must.push({ key: "session_type", match: { any: session_types } });
+  if (session_id) must.push({ key: "session_id", match: { value: session_id } });
+  if (exclude_session_id) must_not.push({ key: "session_id", match: { value: exclude_session_id } });
+  if (!must.length && !must_not.length) return null;
+  const filter = {};
+  if (must.length) filter.must = must;
+  if (must_not.length) filter.must_not = must_not;
+  return filter;
+}
+
+// ── Shared: normalize a Qdrant point payload into an API result ──
+function toResult(p, score, i) {
+  return {
+    fact: p.fact,
+    confidence: score,
+    source: p.source || "vector",
+    timestamp: p.created_at,
+    expiry_type: p.expiry_type,
+    valid_until: p.valid_until,
+    category: p.category,
+    entities: p.entities || [],
+    session_id: p.session_id,
+    session_type: p.session_type,
+    rank: i + 1
+  };
+}
+
+// ── Shared: page through Qdrant scroll (non-semantic listing) ──
+async function scrollPoints(filter, cap = 500) {
+  const out = [];
+  let offset;
+  while (out.length < cap) {
+    const body = { limit: Math.min(256, cap - out.length), with_payload: true, with_vector: false };
+    if (filter) body.filter = filter;
+    if (offset !== undefined && offset !== null) body.offset = offset;
+    const resp = await postJSON(`${QDRANT_URL}/collections/${COLLECTION}/points/scroll`, body, { "api-key": QDRANT_KEY });
+    const result = resp.body && resp.body.result;
+    if (!result) break;
+    const pts = result.points || [];
+    out.push(...pts);
+    offset = result.next_page_offset;
+    if (!pts.length || offset === null || offset === undefined) break;
+  }
+  return out;
+}
+
+// ── Shared: prompt-injectable summary of carried-over facts ──
+function buildDigest(results) {
+  if (!results.length) return "";
+  const byCat = {};
+  for (const r of results) (byCat[r.category || "ENTITY"] ||= []).push(r.fact);
+  const lines = ["Context carried over from other Cammy sessions:"];
+  for (const [cat, facts] of Object.entries(byCat)) {
+    lines.push(`${cat}:`);
+    for (const f of facts) lines.push(`- ${f}`);
+  }
+  return lines.join("\n");
 }
 
 // Embed text(s) via OpenAI
@@ -173,7 +264,10 @@ Skip: greetings, one-time tasks, former employer references, hypotheticals. Only
 // ── POST /facts/search ──────────────────────────────────────
 app.post("/facts/search", async (req, res) => {
   const start = Date.now();
-  const { question, context_tags = [], top_k = 5, include_expired = false } = req.body;
+  const {
+    question, context_tags = [], top_k = 5, include_expired = false,
+    session_id = null, exclude_session_id = null, session_types = [], since = null
+  } = req.body;
   if (!question) return res.status(400).json({ error: "question required" });
 
   try {
@@ -186,11 +280,8 @@ app.post("/facts/search", async (req, res) => {
       score_threshold: 0.60
     };
 
-    if (context_tags.length) {
-      searchBody.filter = {
-        must: [{ key: "category", match: { any: context_tags.map(t => t.toUpperCase()) } }]
-      };
-    }
+    const filter = buildFilter({ categories: context_tags, session_id, exclude_session_id, session_types });
+    if (filter) searchBody.filter = filter;
 
     const searchResp = await postJSON(
       `${QDRANT_URL}/collections/${COLLECTION}/points/search`,
@@ -199,30 +290,109 @@ app.post("/facts/search", async (req, res) => {
     );
 
     const now = new Date();
-    let results = (searchResp.body.result || [])
-      .filter(r => {
-        if (include_expired) return true;
-        if (r.payload.expiry_type === "DATE" && r.payload.valid_until) {
-          return new Date(r.payload.valid_until) > now;
-        }
-        return true;
-      })
-      .map((r, i) => ({
-        fact: r.payload.fact,
-        confidence: r.score,
-        source: r.payload.source || "vector",
-        timestamp: r.payload.created_at,
-        expiry_type: r.payload.expiry_type,
-        valid_until: r.payload.valid_until,
-        category: r.payload.category,
-        entities: r.payload.entities || [],
-        rank: i + 1
-      }));
+    const results = (searchResp.body.result || [])
+      .filter(r => r.payload && (include_expired || isLive(r.payload, now)))
+      .filter(r => !since || String(r.payload.created_at || "") > since)
+      .map((r, i) => toResult(r.payload, r.score, i));
 
     res.json({ results, conflict_flags: [], latency_ms: Date.now() - start });
   } catch(e) {
     console.error("[search]", e.message);
     res.status(500).json({ error: e.message, results: [], latency_ms: Date.now() - start });
+  }
+});
+
+// ── POST /facts/sync ────────────────────────────────────────
+// "What have the OTHER sessions learned that I don't know yet?"
+// Scopes to everything NOT stamped with the caller's session_id. Pass a
+// `question` to rank by semantic relevance, or omit it to get the most recent
+// cross-session facts. Returns a ready-to-inject `digest` alongside the rows.
+app.post("/facts/sync", async (req, res) => {
+  const start = Date.now();
+  const {
+    session_id, question = null, since = null, categories = [], session_types = [],
+    top_k = 20, include_expired = false, digest = true
+  } = req.body;
+  if (!session_id) return res.status(400).json({ error: "session_id required" });
+
+  try {
+    const filter = buildFilter({ categories, session_types, exclude_session_id: session_id });
+    const now = new Date();
+    let rows;
+
+    if (question) {
+      const vector = await embed(question);
+      const body = { vector, limit: Math.min(top_k * 4, 200), with_payload: true, score_threshold: 0.60 };
+      if (filter) body.filter = filter;
+      const resp = await postJSON(`${QDRANT_URL}/collections/${COLLECTION}/points/search`, body, { "api-key": QDRANT_KEY });
+      rows = (resp.body.result || []).map(r => ({ payload: r.payload, score: r.score }));
+    } else {
+      const pts = await scrollPoints(filter, 500);
+      rows = pts.map(p => ({ payload: p.payload, score: (p.payload && p.payload.confidence) || 0.8 }));
+      rows.sort((a, b) => String(b.payload.created_at || "").localeCompare(String(a.payload.created_at || "")));
+    }
+
+    rows = rows
+      .filter(r => r.payload && (include_expired || isLive(r.payload, now)))
+      .filter(r => !since || String(r.payload.created_at || "") > since);
+
+    // The same fact can be extracted independently by several sessions — carry it once.
+    const seen = new Set();
+    const results = [];
+    for (const r of rows) {
+      const key = (r.payload.fact || "").trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      results.push(toResult(r.payload, r.score, results.length));
+      if (results.length >= top_k) break;
+    }
+
+    const body = {
+      session_id,
+      from_sessions: [...new Set(results.map(r => r.session_id).filter(Boolean))],
+      count: results.length,
+      results,
+      latency_ms: Date.now() - start
+    };
+    if (digest) body.digest = buildDigest(results);
+    res.json(body);
+  } catch(e) {
+    console.error("[sync]", e.message);
+    res.status(500).json({ error: e.message, results: [], latency_ms: Date.now() - start });
+  }
+});
+
+// ── GET /sessions ───────────────────────────────────────────
+// What sessions exist to sync from, and how much each one knows.
+app.get("/sessions", async (req, res) => {
+  try {
+    const pts = await scrollPoints(null, 2000);
+    const now = new Date();
+    const map = new Map();
+
+    for (const p of pts) {
+      const pl = p.payload || {};
+      const id = pl.session_id || "unknown";
+      const e = map.get(id) || {
+        session_id: id, session_type: pl.session_type || null,
+        facts: 0, live_facts: 0, first_seen: null, last_seen: null
+      };
+      e.facts++;
+      if (isLive(pl, now)) e.live_facts++;
+      const t = pl.created_at || null;
+      if (t) {
+        if (!e.first_seen || t < e.first_seen) e.first_seen = t;
+        if (!e.last_seen || t > e.last_seen) e.last_seen = t;
+      }
+      map.set(id, e);
+    }
+
+    const sessions = [...map.values()]
+      .sort((a, b) => String(b.last_seen || "").localeCompare(String(a.last_seen || "")));
+    res.json({ sessions, count: sessions.length, sampled_points: pts.length });
+  } catch(e) {
+    console.error("[sessions]", e.message);
+    res.status(500).json({ error: e.message, sessions: [] });
   }
 });
 
@@ -249,7 +419,11 @@ app.post("/facts/upsert", async (req, res) => {
 
 // ── GET /health ─────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ ok: true, v: "1.0", uptime: process.uptime(), time: new Date().toLocaleString("en-US", { timeZone: "America/New_York" }) });
+  res.json({
+    ok: true, v: "1.1", uptime: process.uptime(),
+    time: new Date().toLocaleString("en-US", { timeZone: "America/New_York" }),
+    endpoints: ["/facts/extract", "/facts/search", "/facts/sync", "/facts/upsert", "/sessions"]
+  });
 });
 
-app.listen(PORT, () => console.log(`Cammy Memory API v1.0 on port ${PORT}`));
+app.listen(PORT, () => console.log(`Cammy Memory API v1.1 on port ${PORT}`));
