@@ -15,6 +15,10 @@ $RepoDir  = Split-Path -Parent $PSScriptRoot
 $HookDir  = Join-Path $HOME ".claude\hooks"
 $Settings = Join-Path $HOME ".claude\settings.json"
 
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+  Write-Error "node is not on PATH. Install Node 18+ (https://nodejs.org) and reopen PowerShell."
+}
+
 Write-Host "==> Verifying $Url"
 try {
   $health = Invoke-RestMethod -Uri "$Url/health" -TimeoutSec 15
@@ -41,28 +45,16 @@ New-Item -ItemType Directory -Force -Path (Split-Path $Settings) | Out-Null
 if (-not (Test-Path $Settings)) { "{}" | Set-Content $Settings }
 Copy-Item $Settings "$Settings.bak.$([int][double]::Parse((Get-Date -UFormat %s)))" -Force
 
-# Hooks run through a shell that understands $HOME; an absolute path with
-# forward slashes is the portable choice across Git Bash, WSL and PowerShell.
-$hookPathSync    = ($HookDir + "\memory-sync.mjs")    -replace '\\', '/'
-$hookPathPersist = ($HookDir + "\memory-persist.mjs") -replace '\\', '/'
-
-$cfg = Get-Content $Settings -Raw | ConvertFrom-Json -AsHashtable
-if (-not $cfg) { $cfg = @{} }
-if (-not $cfg.hooks) { $cfg.hooks = @{} }
-
-foreach ($pair in @(@("SessionStart", $hookPathSync, "memory-sync.mjs"),
-                    @("SessionEnd",   $hookPathPersist, "memory-persist.mjs"))) {
-  $event = $pair[0]; $path = $pair[1]; $script = $pair[2]
-  $existing = @()
-  if ($cfg.hooks[$event]) {
-    # Drop any prior Cammy entry so re-running updates instead of duplicating.
-    $existing = @($cfg.hooks[$event] | Where-Object {
-      -not (@($_.hooks) | Where-Object { "$($_.command)" -like "*$script*" })
-    })
-  }
-  $cfg.hooks[$event] = $existing + @(@{ hooks = @(@{ type = "command"; command = "node `"$path`"" }) })
+# The merge runs in Node, not PowerShell: Windows PowerShell 5.1 has no
+# `ConvertFrom-Json -AsHashtable`, and Node is already required here anyway
+# because the hooks themselves are .mjs.
+# An absolute path with forward slashes is what works across the shells Claude
+# Code may invoke the hook through (Git Bash, WSL, PowerShell).
+$hooksForCmd = $HookDir -replace '\\', '/'
+& node (Join-Path $RepoDir "scripts\merge-settings.mjs") $Settings $hooksForCmd
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "could not merge $Settings - it has been left untouched (a backup sits alongside it)"
 }
-($cfg | ConvertTo-Json -Depth 10) | Set-Content $Settings
 Write-Host "    done (previous file backed up alongside it)"
 
 Write-Host "==> Persisting env vars"

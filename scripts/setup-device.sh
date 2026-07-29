@@ -45,21 +45,9 @@ echo "==> Merging hook config into $SETTINGS"
 mkdir -p "$(dirname "$SETTINGS")"
 [[ -f "$SETTINGS" ]] || echo '{}' > "$SETTINGS"
 cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
-node -e '
-const fs = require("fs");
-const p = process.argv[1];
-const cfg = JSON.parse(fs.readFileSync(p, "utf8") || "{}");
-cfg.hooks ??= {};
-const entry = cmd => ({ hooks: [{ type: "command", command: `node "$HOME/.claude/hooks/${cmd}"` }] });
-for (const [event, script] of [["SessionStart", "memory-sync.mjs"], ["SessionEnd", "memory-persist.mjs"]]) {
-  cfg.hooks[event] ??= [];
-  // Replace any prior Cammy entry rather than stacking duplicates on re-run.
-  cfg.hooks[event] = cfg.hooks[event].filter(g =>
-    !(g.hooks || []).some(h => String(h.command || "").includes(script)));
-  cfg.hooks[event].push(entry(script));
-}
-fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
-' "$SETTINGS"
+# Single-quoted so $HOME stays literal in the written command — the hook then
+# resolves it at run time rather than baking in this machine's path.
+node "$REPO_DIR/scripts/merge-settings.mjs" "$SETTINGS" '$HOME/.claude/hooks'
 echo "    done (previous file backed up alongside it)"
 
 echo "==> Persisting env vars"
