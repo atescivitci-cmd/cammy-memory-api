@@ -44,54 +44,47 @@ Render dashboard (never commit values):
 | `QDRANT_API_KEY` | Vector store auth |
 | `MEMORY_API_KEY` | The key each device presents |
 
+**Pick a fresh random value for `MEMORY_API_KEY`.** It is the only thing between
+the open internet and every fact this service holds. The server refuses to start
+without it — there is deliberately no default, because a default here would be a
+password published in a public repo.
+
 Confirm it's live: `curl https://<your-service>.onrender.com/health` should
 report `v: "1.1"`.
 
 ### 2. Point each device at it
 
-On the **Mac** (and any other zsh/bash machine):
+Clone this repo on the machine, then run the setup script for its platform. One
+command does everything: verifies the URL and key against the live service,
+installs both hooks to `~/.claude/hooks/`, merges the hook config into
+`~/.claude/settings.json` (backing up whatever was there), and persists the two
+env vars.
+
+On the **Mac** (or any Linux box):
 
 ```bash
-echo 'export MEMORY_API_URL="https://<your-service>.onrender.com"' >> ~/.zshrc
-echo 'export MEMORY_API_KEY="<your-memory-api-key>"' >> ~/.zshrc
+./scripts/setup-device.sh https://<your-service>.onrender.com <your-memory-api-key>
 ```
 
-On the **Dell** (PowerShell):
+On the **Dell**:
 
 ```powershell
-setx MEMORY_API_URL "https://<your-service>.onrender.com"
-setx MEMORY_API_KEY "<your-memory-api-key>"
+.\scripts\setup-device.ps1 -Url https://<your-service>.onrender.com -Key <your-memory-api-key>
 ```
 
 Open a new terminal afterwards so the variables are present.
 
-Without both variables the hooks exit silently and sessions behave normally —
-so an unconfigured machine is never broken by this, just not synced.
+Both scripts are safe to re-run — they replace their own previous entries rather
+than stacking duplicates — and both refuse to change anything if the URL is
+unreachable or the key is rejected, so you find out immediately rather than via
+silent no-op hooks.
 
-### 3. Enable the hooks beyond this repo
+Installing globally like this covers sessions in **any** directory, not just
+this repo. Sessions working inside this repo also pick the hooks up from the
+committed `.claude/settings.json`, so cloud sessions need no setup at all.
 
-`.claude/settings.json` here is committed, so any session working in **this
-repo** picks the hooks up automatically — including cloud sessions, which get it
-via git with nothing to install.
-
-To sync sessions in *other* directories, copy the hook scripts to
-`~/.claude/hooks/` on each machine and add to `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/memory-sync.mjs\"" }] }
-    ],
-    "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/memory-persist.mjs\"" }] }
-    ]
-  }
-}
-```
-
-On Windows, `$HOME` and `$CLAUDE_PROJECT_DIR` resolve under Git Bash and WSL. In
-a native PowerShell setup, use an absolute path instead.
+Without both env vars the hooks exit silently and sessions behave normally — an
+unconfigured machine is never broken by this, just unsynced.
 
 ## Tuning
 

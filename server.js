@@ -25,7 +25,18 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const QDRANT_URL = process.env.QDRANT_URL || "https://cammy-qdrant.onrender.com";
 const QDRANT_KEY = process.env.QDRANT_API_KEY || "cammy-qdrant-k3y-2026";
 const COLLECTION = "cammy_facts";
-const API_KEY = process.env.MEMORY_API_KEY || "cammy-mem-2026";
+const API_KEY = process.env.MEMORY_API_KEY;
+
+// MEMORY_API_KEY is the only thing standing between the open internet and every
+// fact this service holds, so it has no default — a literal here would be a
+// published password. Refuse to start rather than come up unprotected.
+if (!API_KEY) {
+  console.error("FATAL: MEMORY_API_KEY is not set. Refusing to start — the API would be readable by anyone.");
+  process.exit(1);
+}
+if (QDRANT_KEY === "cammy-qdrant-k3y-2026") {
+  console.warn("WARNING: QDRANT_API_KEY is unset and falling back to the value committed in this repo. Set it in the environment.");
+}
 
 // Auth middleware
 app.use((req, res, next) => {
