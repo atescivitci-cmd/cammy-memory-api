@@ -86,6 +86,19 @@ committed `.claude/settings.json`, so cloud sessions need no setup at all.
 Without both env vars the hooks exit silently and sessions behave normally — an
 unconfigured machine is never broken by this, just unsynced.
 
+## If setup fails
+
+| Symptom | Cause |
+|---|---|
+| `API rejected that key` | The key doesn't match the deployed `MEMORY_API_KEY`. Re-copy it from the Render dashboard — and check you didn't paste the placeholder. |
+| `could not reach .../health` | The service isn't deployed, or the URL is wrong. |
+| `node is not on PATH` | Install Node 18+ and reopen the terminal. |
+| `running scripts is disabled` (Windows) | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, then retry. |
+| `git is not recognized` (Windows) | Install Git from git-scm.com and reopen PowerShell. |
+
+Both scripts verify the URL and key before writing anything, so a failure at
+either of those points leaves the machine exactly as it was.
+
 ## Tuning
 
 | Variable | Default | Effect |

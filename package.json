@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/sync.smoke.mjs && node test/hooks.smoke.mjs"
+    "test": "node test/sync.smoke.mjs && node test/hooks.smoke.mjs && node test/merge-settings.smoke.mjs"
   },
   "dependencies": { "express": "^4.18.2" },
   "engines": { "node": ">=18" }

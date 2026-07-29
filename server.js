@@ -35,7 +35,7 @@ if (!API_KEY) {
   process.exit(1);
 }
 if (QDRANT_KEY === "cammy-qdrant-k3y-2026") {
-  console.warn("WARNING: QDRANT_API_KEY is unset and falling back to the value committed in this repo. Set it in the environment.");
+  console.warn("WARNING: QDRANT_API_KEY matches the value committed in this repo, so anyone who can read the source can reach the vector store directly. Rotate it in Qdrant and set the new value here.");
 }
 
 // Auth middleware
