@@ -96,7 +96,24 @@ function putJSON(url, body, headers = {}) {
 }
 
 // Ensure Qdrant collection exists
+// PHASE 0.3: latch it. ensureCollection ran on EVERY write - both /facts/extract and
+// /facts/upsert awaited it - doing one collection PUT plus three index PUTs to Qdrant.
+// After the first call all four are no-ops that still cost a full network round-trip each,
+// which is the 120-320ms per write the audit measured. Memoise the promise so the work
+// happens once per process; concurrent callers await the same in-flight promise rather than
+// racing four duplicate PUTs. A failure is not cached - the latch resets so the next write
+// retries rather than inheriting a permanently broken collection.
+let _collectionReady = null;
 async function ensureCollection() {
+  if (_collectionReady) return _collectionReady;
+  _collectionReady = _ensureCollectionOnce().catch((e) => {
+    _collectionReady = null;   // do not cache a failure
+    throw e;
+  });
+  return _collectionReady;
+}
+
+async function _ensureCollectionOnce() {
   try {
     await putJSON(`${QDRANT_URL}/collections/${COLLECTION}`,
       { vectors: { size: 1536, distance: "Cosine" }, on_disk_payload: true },
