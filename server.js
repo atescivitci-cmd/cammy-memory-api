@@ -23,7 +23,7 @@ app.use(express.json({ limit: "2mb" }));
 const PORT = process.env.PORT || 3000;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const QDRANT_URL = process.env.QDRANT_URL || "https://cammy-qdrant.onrender.com";
-const QDRANT_KEY = process.env.QDRANT_API_KEY || "cammy-qdrant-k3y-2026";
+const QDRANT_KEY = process.env.QDRANT_API_KEY;
 const COLLECTION = "cammy_facts";
 const API_KEY = process.env.MEMORY_API_KEY;
 
@@ -34,8 +34,14 @@ if (!API_KEY) {
   console.error("FATAL: MEMORY_API_KEY is not set. Refusing to start — the API would be readable by anyone.");
   process.exit(1);
 }
-if (QDRANT_KEY === "cammy-qdrant-k3y-2026") {
-  console.warn("WARNING: QDRANT_API_KEY matches the value committed in this repo, so anyone who can read the source can reach the vector store directly. Rotate it in Qdrant and set the new value here.");
+// QDRANT_API_KEY gets the same treatment as MEMORY_API_KEY above. It used to fall
+// back to a literal committed in this public repo, which meant a fresh deploy that
+// forgot to set it came up reachable by anyone who could read the source. That key
+// is rotated and the default is gone: fail loudly instead of running on a published
+// credential.
+if (!QDRANT_KEY) {
+  console.error("FATAL: QDRANT_API_KEY is not set. Refusing to start — there is deliberately no default.");
+  process.exit(1);
 }
 
 // Auth middleware
